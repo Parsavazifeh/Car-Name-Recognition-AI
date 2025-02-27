@@ -132,9 +132,20 @@ celerybeat.pid
 .venv
 env/
 venv/
+Carenv/
+results/
+kt_dir/
 ENV/
 env.bak/
 venv.bak/
+
+# Ignore dataset files
+dataset/
+
+# Ignore other common files
+*.csv
+*.json
+*.xlsx
 
 # Spyder project settings
 .spyderproject
