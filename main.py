@@ -7,156 +7,166 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Input, Dropout
 from tensorflow.keras.applications import ResNet50, VGG16
+from tensorflow.keras.applications.resnet50 import preprocess_input as resnet_preprocess
+from tensorflow.keras.applications.vgg16 import preprocess_input as vgg_preprocess
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.regularizers import l2
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from sklearn.utils.class_weight import compute_class_weight
 import config
 import utils
+from tensorflow.keras import layers, applications
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras import mixed_precision
 
-def build_model(num_classes, unfreeze_layers=80, dense_units=1024, dropout_rate=0.0):
-    if config.MODEL_NAME == "ResNet50":
-        base_model = ResNet50(weights='imagenet', include_top=False, 
-                              input_tensor=Input(shape=(config.IMAGE_SIZE[0], config.IMAGE_SIZE[1], config.NUM_CHANNELS)))
-    elif config.MODEL_NAME == "VGG16":
-        base_model = VGG16(weights='imagenet', include_top=False, 
-                           input_tensor=Input(shape=(config.IMAGE_SIZE[0], config.IMAGE_SIZE[1], config.NUM_CHANNELS)))
-    else:
-        raise ValueError("Unsupported MODEL_NAME")
-    for layer in base_model.layers[:-unfreeze_layers]:
-        layer.trainable = False
-    for layer in base_model.layers[-unfreeze_layers:]:
-        layer.trainable = True
-    x = base_model.output
-    x = GlobalAveragePooling2D()(x)
-    x = Dense(dense_units, activation='relu')(x)
-    if dropout_rate > 0:
-        x = Dropout(dropout_rate)(x)
-    predictions = Dense(num_classes, activation='softmax')(x)
-    model = Model(inputs=base_model.input, outputs=predictions)
+# Enable mixed precision for better performance
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_global_policy(policy)
+
+def build_model(image_size, num_classes):
+    # Use EfficientNet with imagenet weights
+    base_model = EfficientNetB0(include_top=False, 
+                               weights='imagenet', 
+                               input_shape=(image_size[0], image_size[1], 3))
+    
+    # Freeze initial layers
+    base_model.trainable = False
+    
+    # Enhanced head architecture
+    inputs = layers.Input(shape=(image_size[0], image_size[1], 3))
+    x = applications.efficientnet.preprocess_input(inputs)
+    x = base_model(x, training=False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(256, activation='relu', 
+                    kernel_regularizer=tf.keras.regularizers.l1_l2(l1=1e-5, l2=1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(num_classes, activation='softmax', dtype='float32')(x)
+    
+    model = tf.keras.Model(inputs, outputs)
     return model
+
+def create_data_pipeline(dataset_dir, image_size, batch_size):
+    # Advanced augmentation
+    train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
+        preprocessing_function=applications.efficientnet.preprocess_input,
+        rotation_range=45,
+        width_shift_range=0.3,
+        height_shift_range=0.3,
+        shear_range=0.2,
+        zoom_range=0.3,
+        brightness_range=[0.7,1.3],
+        channel_shift_range=50,
+        horizontal_flip=True,
+        vertical_flip=True,
+        validation_split=0.2
+    )
+
+    # Oversampling for class imbalance
+    train_generator = train_datagen.flow_from_directory(
+        dataset_dir,
+        target_size=image_size,
+        batch_size=batch_size,
+        class_mode='categorical',
+        subset='training',
+        seed=42,
+        shuffle=True,
+        interpolation='bicubic'
+    )
+
+    # Calculate class weights
+    class_counts = np.bincount(train_generator.classes)
+    max_count = np.max(class_counts)
+    class_weights = {i: max_count/count for i, count in enumerate(class_counts)}
+
+    # Validation generator
+    val_generator = train_datagen.flow_from_directory(
+        dataset_dir,
+        target_size=image_size,
+        batch_size=batch_size,
+        class_mode='categorical',
+        subset='validation',
+        shuffle=False
+    )
+
+    return train_generator, val_generator, class_weights
 
 def train_model():
-    train_datagen = ImageDataGenerator(
-        rescale=1./255,
-        validation_split=0.2,
-        horizontal_flip=config.AUGMENTATION,
-        rotation_range=20 if config.AUGMENTATION else 0,
-        zoom_range=0.2 if config.AUGMENTATION else 0
-    )
-    train_generator = train_datagen.flow_from_directory(
-        config.DATASET_DIR,
-        target_size=config.IMAGE_SIZE,
-        batch_size=config.BATCH_SIZE,
-        class_mode='categorical',
-        subset='training',
-        seed=config.SEED
-    )
-    validation_generator = train_datagen.flow_from_directory(
-        config.DATASET_DIR,
-        target_size=config.IMAGE_SIZE,
-        batch_size=config.BATCH_SIZE,
-        class_mode='categorical',
-        subset='validation',
-        seed=config.SEED
-    )
-    num_classes = len(train_generator.class_indices)
-    model = build_model(num_classes, unfreeze_layers=80, dense_units=1024, dropout_rate=0.1)
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
-    checkpoint = ModelCheckpoint(config.MODEL_SAVE_PATH, monitor='val_accuracy', save_best_only=True, verbose=1)
-    earlystop = EarlyStopping(monitor='val_accuracy', patience=5, verbose=1, restore_best_weights=True)
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
-    history = model.fit(
-        train_generator,
-        steps_per_epoch=len(train_generator),
-        validation_data=validation_generator,
-        validation_steps=len(validation_generator),
-        epochs=config.EPOCHS,
-        callbacks=[checkpoint, earlystop, reduce_lr]
-    )
-    utils.plot_history(history)
-    model.save(config.MODEL_SAVE_PATH)
-    print("Model saved at:", config.MODEL_SAVE_PATH)
+    # Configuration
+    image_size = (380, 380)  # Increased resolution
+    batch_size = 32
 
-def build_hypermodel(hp, num_classes):
-    if config.MODEL_NAME == "ResNet50":
-        base_model = ResNet50(weights='imagenet', include_top=False, 
-                              input_tensor=Input(shape=(config.IMAGE_SIZE[0], config.IMAGE_SIZE[1], config.NUM_CHANNELS)))
-    elif config.MODEL_NAME == "VGG16":
-        base_model = VGG16(weights='imagenet', include_top=False, 
-                           input_tensor=Input(shape=(config.IMAGE_SIZE[0], config.IMAGE_SIZE[1], config.NUM_CHANNELS)))
-    else:
-        raise ValueError("Unsupported MODEL_NAME")
-    unfreeze_layers = hp.Int('unfreeze_layers', min_value=50, max_value=100, step=10, default=80)
-    for layer in base_model.layers[:-unfreeze_layers]:
-        layer.trainable = False
-    for layer in base_model.layers[-unfreeze_layers:]:
-        layer.trainable = True
-    x = base_model.output
-    x = GlobalAveragePooling2D()(x)
-    dense_units = hp.Int('dense_units', min_value=512, max_value=2048, step=256, default=1024)
-    x = Dense(dense_units, activation='relu')(x)
-    dropout_rate = hp.Float('dropout_rate', min_value=0.0, max_value=0.5, step=0.1, default=0.1)
-    if dropout_rate > 0:
-        x = Dropout(dropout_rate)(x)
-    predictions = Dense(num_classes, activation='softmax')(x)
-    model = Model(inputs=base_model.input, outputs=predictions)
-    lr = hp.Float('learning_rate', min_value=1e-5, max_value=5e-4, sampling='LOG', default=1e-4)
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr), loss='categorical_crossentropy', metrics=['accuracy'])
-    return model
+    # Create data pipeline
+    train_gen, val_gen, class_weights = create_data_pipeline(
+        config.DATASET_DIR, 
+        image_size,
+        batch_size
+    )
+    
+    # Build model
+    model = build_model(image_size, train_gen.num_classes)
+    
+    # Phase 1: Train head
+    model.compile(optimizer=tf.keras.optimizers.AdamW(learning_rate=1e-3),
+                loss='categorical_crossentropy',
+                metrics=['accuracy'])
+    
+    # Callbacks
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            config.MODEL_SAVE_PATH,
+            monitor='val_accuracy',
+            save_best_only=True,
+            mode='max'
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.2,
+            patience=3,
+            min_lr=1e-6
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_accuracy',
+            patience=15,
+            mode='max',
+            restore_best_weights=True
+        )
+    ]
 
-def tune_model():
-    train_datagen = ImageDataGenerator(
-        rescale=1./255,
-        validation_split=0.2,
-        horizontal_flip=config.AUGMENTATION,
-        rotation_range=20 if config.AUGMENTATION else 0,
-        zoom_range=0.2 if config.AUGMENTATION else 0
+    # Phase 1 Training
+    print("\n=== Training Head ===")
+    model.fit(
+        train_gen,
+        epochs=20,
+        validation_data=val_gen,
+        class_weight=class_weights,
+        callbacks=callbacks
     )
-    train_generator = train_datagen.flow_from_directory(
-        config.DATASET_DIR,
-        target_size=config.IMAGE_SIZE,
-        batch_size=config.BATCH_SIZE,
-        class_mode='categorical',
-        subset='training',
-        seed=config.SEED
-    )
-    validation_generator = train_datagen.flow_from_directory(
-        config.DATASET_DIR,
-        target_size=config.IMAGE_SIZE,
-        batch_size=config.BATCH_SIZE,
-        class_mode='categorical',
-        subset='validation',
-        seed=config.SEED
-    )
-    num_classes = len(train_generator.class_indices)
-    tuner = kt.RandomSearch(
-        lambda hp: build_hypermodel(hp, num_classes),
-        objective='val_accuracy',
-        max_trials=10,
-        executions_per_trial=1,
-        directory='kt_dir',
-        project_name='car_recognition'
-    )
-    tuner.search(
-        train_generator,
-        steps_per_epoch=len(train_generator),
-        validation_data=validation_generator,
-        validation_steps=len(validation_generator),
-        epochs=config.EPOCHS,
-        callbacks=[EarlyStopping(monitor='val_accuracy', patience=3, verbose=1)]
-    )
-    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
-    model = tuner.hypermodel.build(best_hps)
-    history = model.fit(
-        train_generator,
-        steps_per_epoch=len(train_generator),
-        validation_data=validation_generator,
-        validation_steps=len(validation_generator),
-        epochs=config.EPOCHS,
-        callbacks=[ModelCheckpoint(config.MODEL_SAVE_PATH, monitor='val_accuracy', save_best_only=True, verbose=1)]
-    )
-    utils.plot_history(history)
+
+    # Phase 2: Gradual Unfreezing
+    print("\n=== Fine-tuning ===")
+    for i in range(len(model.layers[1].layers)-10, 0, -30):  # Unfreeze in stages
+        model.layers[1].trainable = True
+        for layer in model.layers[1].layers[:i]:
+            layer.trainable = False
+        
+        # Use lower learning rate for earlier layers
+        lr = 3e-5 * (1 - i/len(model.layers[1].layers)) + 1e-6
+        model.compile(optimizer=tf.keras.optimizers.AdamW(learning_rate=lr),
+                    loss='categorical_crossentropy',
+                    metrics=['accuracy'])
+        
+        model.fit(
+            train_gen,
+            epochs=5,
+            validation_data=val_gen,
+            class_weight=class_weights,
+            callbacks=callbacks
+        )
+
+    # Final training
     model.save(config.MODEL_SAVE_PATH)
-    print("Best hyperparameters:", best_hps.values)
-    print("Model saved at:", config.MODEL_SAVE_PATH)
+    print(f"Model saved to {config.MODEL_SAVE_PATH}")
 
 def predict_image(image_path):
     model = tf.keras.models.load_model(config.MODEL_SAVE_PATH)
@@ -177,13 +187,10 @@ def predict_image(image_path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--train', action='store_true')
-    parser.add_argument('--tune', action='store_true')
     parser.add_argument('--predict', type=str)
     args = parser.parse_args()
     if args.train:
         train_model()
-    elif args.tune:
-        tune_model()
     elif args.predict:
         predict_image(args.predict)
     else:
